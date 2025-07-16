@@ -1,0 +1,593 @@
+---
+title: "Time To Churn"
+author: "Matthew Davis, PhD"
+output:
+  html_document:
+    number_sections: no
+    toc: yes
+    toc_depth: 3
+  pdf_document: default
+  word_document:
+    toc: yes
+    toc_depth: '3'
+editor_options:
+  chunk_output_type: inline
+---
+
+
+<style>
+
+/* Style author */
+.author {
+  text-align: center;
+  font-style: italic;
+}
+
+/* Style top-level headers (h1): center, bold, underline */
+h1 {
+  text-align: center;
+  font-weight: bold;
+  text-decoration: underline;
+}
+
+/* Style title */
+.title {
+  text-align: center;
+  font-weight: bold;
+  text-decoration: default;
+}
+
+/* Leave subheaders (h2, h3...) with default formatting */
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, fig.width = 7.5, fig.height = 10)
+setwd("C:/Users/defgi/Documents/")
+library(lgspline)
+library(pander)
+library(kableExtra)
+library(readxl)
+library(dplyr)
+library(parallel)
+library(survival)
+library(MachineShop)
+options(digits = 4, scipen = 999)
+```
+
+# Introduction
+
+There exists a small but fast-growing coffee company that provides a subscription-based service, where coffee pods are sent via mail to customers on a monthly basis. Like all subscription-based services, it is crucial for them to prevent customers from stopping their service, which in business analytics jargon is often referred to as "churn" (see Carl Gold's "Fighting Churn with Data" for comprehensive background). 
+
+For a typical churn analysis, data is collected on customer behaviors, baseline characteristics, as well as any interventions a company many provide. These serve as predictors for a statistical or a supervised machine learning model. The response variable is usually whether or not a customer churns within a given time period (for example, whether or not they last longer than a month), and the goal is to identify and implement effective interventions to help prevent churn in the future. 
+
+There is nothing wrong with dichotomizing the outcome as such from a statistical perspective. In biostatistics literature, this is sometimes referred to as "landmarking". But for a company truly interested in maximizing profit, a dichotomous outcome isn't helpful, and inferences gained from analyzing such a response can be extremely misleading.
+
+For illustration with an extreme example, consider two interventions "A" and "B" and suppose interest was in predicting churn after 1 month. Suppose intervention "A" causes half of customers to quit their subscription after 1 month, and half of customers to quit subscription after 2 months, while subscription "B" causes 3/4ths of customers to quit after 1 month, while 1/4 of customers never quit at all. Intervention "A" would look much better for a 1-month churn response (with 0.5 estimated probability of churn vs. 0.75 estimated probability of churn). But intervention "B", which completely prevents some customers from churning at all, might might be much more profitable in the long run. The example is extreme via its simplicity, but it's not unrealistic; most subscription-based businesses survive based on the continued subscription of a small but loyal group of customers. 
+
+The obvious counterpoint is to simply perform multiple analyses with multiple cutoffs, but questions remain such as "what cutoffs do we choose?" and for the statisticians, "how do we control our Type-I error with multiple, sequential, highly correlated tests?". It is not fun for the presenter or audience when a half-dozen models with slightly different interpretations must explained and reconciled into a unified interpretation. 
+
+The other less-obvious counterpoint is to focus analysis on finding customer characteristics that define the "loyal" group, oftentimes using clustering or unsupervised methods. But this makes two fundamental assumptions: 1) there is something indeed in common with the loyal customers and 2) we have access to that characteristic in our dataset. If both assumptions hold it's a useful approach, otherwise it's useless - and focusing on the relation between interventions and churn is just much more difficult using unsupervised techniques. 
+
+But there is an easier way that doesn't require these assumptions. A much richer description of the distribution of churn is to treat it as a right-censored time-to-event variable, and perform a survival analysis with censorship indicators for (churn = "dying" = observed, continued subscription = "surviving" = right-censored). With just a single fitted model, we can predict the proportion of subjects who will churn for any arbitrary cutoff we choose (1-day, 30-days, 60-days, 1 year etc.). But more importantly, a survival analysis allows companies to directly estimate the profitability of certain interventions. When dichotomizing the response, answering the simple of question "is this intervention profitable?" is impossible to answer directly, but not when treating it as time-to-event.
+
+For the coffee company I worked with, "interventions" included emails with various advertisements and special deals offered. Interventions were sent out as "repeat order confirmations" for existing customers already subscribed, with different deals offered and advertisements provided to encourage continued subscription. Customer behaviors included how many emails they were sent, how many were opened, and how many were clicked on. Baseline characteristics included time of year, whether they had previously skipped a payment, paused a subscription, or swapped one subscription for another.
+
+My tasks as requested by a representative of the company included the following: 
+
+1) Provide which interventions and predictors are most important for predicting churn
+
+2) Perform statistical analysis on interventions
+
+3) Provide a simple auto-recommendation tool for suggesting recommendations to future customers
+
+In the sections below, I process raw data from as provided by the company and fit a single Weibull accelerated failure time (AFT) model to accomplish all of the above tasks, using my package "lgspline" as available on CRAN. 
+
+Hence, this project both serves to show how a method ubiquitously used in biostatistics can be used to answer important questions in business analytics, and to demonstrate the flexibility of lgspline for survival analyses in general. 
+
+This is a simplified version of the analysis and tool I provided, in order to illustrate the key concepts in an informal manner. 
+
+# Data Pre-Processing 
+
+Code for data pre-processing (e.g. feature engineering) is provided for readers interested. However, for privacy reasons (customer email addresses are shown), I will not be uploading the raw data. 
+
+Instead, you can load the processed and anonymized data from my github site.
+
+```{r, eval = FALSE}
+## ## Load Data
+sub_events <- readxl::read_xlsx("C:/Users/defgi/Documents/Churn/subcription_events.xlsx")
+print(head(sub_events))
+```
+
+```{r, eval = FALSE}
+## ## Time-to-Event response variable and past subscription changes
+## Extract ID and Date, as well as status
+sub_events$ID <- sub_events$`Customer Email (PII)`
+sub_events$TIME <- as.numeric(gsub('day', '', gsub(' days', '', sub_events$`Subscription Events Days Since Creation`)))
+sub_events$STATUS <- ifelse(sub_events$`Subscription Events Recharge Status` == 'cancelled',
+                            1,
+                            0)
+sub_events$STATUS_ALT <- ifelse(sub_events$`Subscription Events Event Name Raw` %in% c('Cancelled',
+                                                                                      'Paused',
+                                                                                      'Skipped'),
+                            1,
+                            0)
+
+## For each subject, output a row where
+# we have their ID,
+# their time recorded thus far,
+# and if they are still subscribed at this timepoint
+# if they are not subscribed, the algorithm will find
+# the point at which they last cancelled
+data <- t(sapply(unique(sub_events$ID), function(id){
+  subset <- subset(sub_events, ID == id)
+  subset_max <- subset[subset$TIME == max(subset$TIME), , drop=FALSE]
+  subset_max <- subset_max[1, , drop=FALSE]
+
+  ## Have they previously delayed or swapped, prior to last time point?
+  prev_subset <- subset[!(subset$TIME == max(subset$TIME)),,drop=FALSE]
+  if(nrow(prev_subset) >= 1){
+    prev_paused <-
+      1*any(prev_subset$`Subscription Events Event Type` == 'Paused')
+    prev_skipped <-
+      1*any(prev_subset$`Subscription Events Event Type` == 'Skipped')
+    prev_unskipped <-
+      1*any(prev_subset$`Subscription Events Event Type` == 'Unskipped')
+    prev_swapped <-
+      1*any(prev_subset$`Subscription Events Event Type` == 'Swapped')
+  } else {
+    prev_paused <- 0
+    prev_skipped <- 0
+    prev_unskipped <- 0
+    prev_swapped <- 0
+  }
+
+  ## Extract first event of cancellation, or last "alive" status
+  if(subset_max$STATUS == 0){
+    subset_cancelled <-
+      subset[subset$STATUS == 0,]
+    subset_cancelled_first <-
+      subset_cancelled[which.min(subset_cancelled$TIME),,drop=FALSE]
+    return(data.frame(subset_cancelled_first[1, c('ID','TIME','STATUS', 'STATUS_ALT')],
+             prev_paused,
+             prev_skipped,
+             prev_unskipped,
+             prev_swapped))
+  } else {
+
+  ## Return features and outcome
+    return(data.frame(subset_max[1, c('ID','TIME','STATUS', 'STATUS_ALT')],
+             prev_paused,
+             prev_skipped,
+             prev_unskipped,
+             prev_swapped))
+  }
+}))
+save(data , file = 'C:/Users/defgi/Documents/Churn/id_time_status_churn.RData')
+```
+
+
+```{r, eval = FALSE}
+## ## Incorporating treatment information and time of year
+# Load treatment assignments
+load('C:/Users/defgi/Documents/Churn/id_time_status_churn.RData')
+treatment_raw <- readxl::read_xlsx('C:/Users/defgi/Documents/Churn/treatment_emails.xlsx')
+
+## Day of year for detecting cyclical trends
+day_of_year <- function(date) {
+
+    ## Extract year, month, and day components
+    year <- as.integer(format(date, "%Y"))
+    month <- as.integer(format(date, "%m"))
+    day <- as.integer(format(date, "%d"))
+
+    ## Create cumulative days vector for normal years
+    days_in_month <- c(31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+    cum_days <- c(0, cumsum(days_in_month)[-12])
+
+    ## Calculate day of year
+    result <- cum_days[month] + day
+
+    ## Adjust for leap years
+    is_leap_year <- (year %% 4 == 0 & year %% 100 != 0) | (year %% 400 == 0)
+    leap_adjustment <- as.integer(is_leap_year & month > 2)
+
+    result <- result + leap_adjustment
+
+    return(result)
+}
+treatment_raw$day_of_year <-
+  day_of_year(as.Date(treatment_raw$`Klaviyo Events Occurred Date`))
+
+
+## Prop. Email/Received
+treatment_raw$ID <- treatment_raw$`Klaviyo Persons Email`
+treatment_raw$message <- treatment_raw$`Klaviyo Events Message Name`
+treatment_raw$Event <- sapply(treatment_raw$`Klaviyo Events Event Type`,
+                              function(ev){
+                                if(ev == "Bounced Email") return('bounced')
+                                if(ev == "Clicked Email") return('clicked')
+                                if(ev == "Clicked email to unsubscribe") return('unsub')
+                                if(ev == "Marked Email as Spam") return('spam')
+                                if(ev == "Opened Email") return('opened')
+                                if(ev == "Received Email") return('received') else return('none')})
+
+treatment_actions <- treatment_raw %>%
+  group_by(ID) %>%
+  summarize(n_open = sum(Event == 'opened'),
+            n_click = sum(Event == 'clicked'),
+            n_bad = sum(Event %in% c('bounced', 'spam', 'unsub')),
+            n_email = sum(Event == "received"),
+            day = max(day_of_year),
+            message_name = names(table(message)[which.max(day_of_year)]))
+
+
+## Dummy-intercept code the interventions
+one_hot_encode <- function(x) {
+    # Input validation
+    if (!is.factor(x)) {
+        if (is.character(x)) {
+            x <- factor(x)
+        } else {
+            stop("Input must be a factor or character vector")
+        }
+    }
+
+    # Get factor levels, excluding the first level (which will be the reference/dummy)
+    levels_to_encode <- levels(x)[-1]
+    n_levels <- length(levels_to_encode)
+
+    # Create empty matrix with appropriate dimensions and column names
+    n_rows <- length(x)
+    result <- matrix(0,
+                    nrow = n_rows,
+                    ncol = n_levels,
+                    dimnames = list(NULL, levels_to_encode))
+
+    # Fill the matrix
+    for (i in seq_len(n_levels)) {
+        result[, i] <- as.integer(x == levels_to_encode[i])
+    }
+
+    # Convert to numeric matrix and return
+    return(as.matrix(result))
+}
+unq_messages <- unique(treatment_actions$message_name)
+messages <- one_hot_encode(factor(treatment_actions$message_name))
+
+## Merge with other data
+d1 <- data[data[,'ID'] %in% treatment_actions[,'ID']$ID,]
+d2 <- treatment_actions[treatment_actions[,'ID']$ID %in% data[,'ID'],]
+d3 <- messages[treatment_actions[,'ID']$ID %in% data[,'ID'],]
+ord1 <- order(unlist(d1[,'ID']))
+ord2 <- order(d2[,'ID']$ID)
+d2$ID <- NULL
+d2$message_name <- NULL
+data <- as.data.frame(cbind(d1[ord1,], as(d2[ord2,],'matrix'), d3[ord2,]))
+for(j in 1:ncol(data)){
+  data[[j]] <- unlist(data[[j]])
+}
+rownames(data) <- NULL
+save(data , file = 'C:/Users/defgi/Documents/Churn/predictor_response_churn.RData')
+```
+
+# Modelling 
+
+In this section, I use the functionality of lgspline to model survival time as a function of the aforementioned predictors.
+
+## Isolating the Features We Care About
+
+Below is a tabulation of the various variables I worked with. Minimum and maximum observed values and variable types are provided for the response variable, censorship indicator, and all predictors in the dataset. 
+
+```{r}
+## Load previously prepared data
+load('C:/Users/defgi/Documents/Churn/predictor_response_churn.RData')
+
+## Keep if > 30 observations only 
+# Only 7 observations, remove
+data$repeat_order_confirmation_gift_purchase <- NULL
+
+# Only 12 observations, remove
+data$repeat_order_confirmation_dynamic_PULLUP <- NULL
+
+# Only 19 observations, remove
+data$repeat_order_confirmation_GIFT_CITY <- NULL
+
+# Only 25 observations, remove
+data$repeat_order_confirmation_GIFT_MANOS_A <- NULL
+
+
+## Unique messages we have left
+unq_messages <- colnames(data)[grep('repeat_order',
+                                    colnames(data))]
+## Predictors
+X <- data[,c(
+             'n_open',
+             'n_email',
+             'n_click',
+             'day',
+             'prev_unskipped',
+             'prev_skipped',
+             'prev_swapped',
+             'prev_paused',
+              unq_messages
+           )]
+X <- as(X, 'matrix')
+y <- (data$TIME + 1)/30.4375
+status <- data$STATUS == 1
+X <- X[,apply(abs(X), 2, sum) > 30]# at least 30 observations per intervention
+datsum <- cbind(y, status, X)
+displaythis <- t(round(apply(datsum, 2, range), 2))
+displaythis <- cbind(rownames(displaythis), displaythis, c("Right-Censored Response",
+                                                           "Censorship Indicator",
+                                                           "Integer",
+                                                           "Integer",
+                                                           "Integer",
+                                                           "Integer",
+                                                           rep("Indicator", 12)))
+colnames(displaythis) <- c("Variable", "Minimum", "Maximum", "Type")
+rownames(displaythis) <- NULL
+kable(displaythis)
+```
+
+
+The dataset in total has 34,557 observations and 14 predictors. 
+
+```{r}
+pander(dim(X))
+```
+
+## Model Fitting
+
+While various numbers of partitions (K+1) were experimented with for a proper smoothing spline, I found a simple cubic relation of day, clicks, opens, emails sent, and to time-to-churn was ultimately found to be optimal as determined by AIC and examining the model fit visually. Interaction terms did not seem to improve model fit. Linear effects were assumed for all indicator variables. Unique penalization per each predictor was incorporated, as is default in lgspline (the degree of smoothing or penalization differs between predictors). 
+
+```{r, eval = FALSE}
+## Setup
+set.seed(1234)
+strt <- Sys.time()
+df <- as.data.frame(X)
+
+## Fit a custom Weibull AFT spline model at optimal penalties
+fitt <- lgspline(response = y,
+                 predictors = X,
+                 just_linear_without_interactions = 5:ncol(X),
+                 unconstrained_fit_fxn = unconstrained_fit_weibull,
+                 include_quartic_terms = FALSE,
+                 include_2way_interactions = FALSE,
+                 include_3way_interactions = FALSE,
+                 family = weibull_family(),
+                 need_dispersion_for_estimation = TRUE,
+                 dispersion_function = weibull_dispersion_function,
+                 glm_weight_function = weibull_glm_weight_function,
+                 shur_correction_function = weibull_shur_correction,
+                 K = 0,
+                 invsoftplus_initial_wiggle = log(exp(1e-5)-1),
+                 invsoftplus_initial_flat = log(exp(1e-2)-1),
+                 include_warnings = FALSE,
+                 status = status)
+save(fitt,
+     y,
+     X,
+     status,
+     file = 'C:/Users/defgi/Documents/simple_model_fit_for_demo.RData')
+
+nd <- Sys.time()
+print(nd - strt)
+```
+
+The raw coefficients ($\beta_{0...25}$) as estimated from the model appear below, which can be read off directly as a log-linear regression model of the form:
+
+$$
+E[\log(Time)] = \beta_0 + \beta_1(n_{open})+\beta_2(n_{email})+\cdots
+$$
+
+```{r}
+load('C:/Users/defgi/Documents/simple_model_fit_for_demo.RData')
+showthis <- fitt$B[[1]]
+colnames(showthis) <- "Estimate"
+kable(showthis)
+```
+
+## Model Diagnostics
+
+Below, a classic Weibull plot comparing log time-to-churn vs. the log(-log(S(time-to-churn))) is shown, along with an ordinary least squares fit. The model fit overall seems reasonable (the relationship between log time-to-churn and estimated log-negative-log survival function appears linear), without any obvious systemic deviations. 
+
+
+```{r}
+## ## Note the following relations
+#   survreg's scale  =    1/(rweibull shape)
+#   weibull shape = 1/survreg scale = sqrt(1/(lgspline dispersion))
+#   survreg's intercept = log(rweibull scale)
+#   weibull scale = yhat
+yaxis <- log(-log(1-pweibull(fitt$y, 
+                  shape = 1/sqrt(fitt$sigmasq_tilde),
+                  scale = fitt$ytilde)))
+xaxis <- log(fitt$y)
+plot(xaxis, yaxis, 
+     xlab = "log(Time)",
+     ylab = "Estimated log(-log(1-F(Time)))",
+     main = "Weibull Plot for Assessing Model Fit")
+ols_fit <- lm(yaxis ~ xaxis)
+abline(ols_fit$coefficients[1], ols_fit$coefficients[2])
+```
+
+The C-index for assessing the ordering of fitted survival times is also shown, with a value ~0.80 indicating modest in-sample performance.
+
+```{r}
+pander(performance(survival::Surv(fitt$y, status), fitt$ytilde))
+```
+
+
+# Analysis 
+
+In this section, using the fitted model, various inferential exercises are carried out. 
+
+## Relative Variable Importance 
+
+Below, the most important variables as determined using permutation importance with censored Weibull log-likelihood as the objective.
+
+The most important variable was day of year, which makes sense; over the course of a year, customer behaviors are going to change (think of how getting your tax returns, upcoming holidays, or changes in weather affect your own subscription habits). This was followed closely by number of emails received and whether the customer had previously swapped subscription types, all having a mostly positive association with time-to-churn (although for day of year and number of emails, this relationship was non-linear). 
+
+Interventions seemed to have modest effect, with exception of the dynamic "ADVENT" gift which stood out in terms of importance.
+
+Interestingly, variables for "previously unskipping" and the number of emails actually opened were not as influential to the model. 
+
+```{r, fig.width=20, fig.height=11}
+par(mar = c(5.1, 25.1, 4.1, 2.1))
+set.seed(1234)
+
+## Permutation importance
+log_y <- log(fitt$y)
+log_mu <- log(fitt$ytilde)
+scale <- fitt$sigmasq_tilde
+
+## Maximum log-likelihood
+current_log_likelihood <- loglik_weibull(log(fitt$y), 
+                                         log(fitt$ytilde), 
+                                         status, 
+                                         fitt$sigmasq_tilde)
+
+## Permuted log-likelihood
+permute_stats <- sapply(1:ncol(X), function(i){
+  mean(
+    sapply(1:10, function(j){
+      permuted_input <- X
+      permuted_input[,i] <- sample(permuted_input[,i])
+      permute_predict <- log(fitt$predict(new_predictor = permuted_input))
+      if(any(!is.finite(permute_predict))){
+        permute_predict[!is.finite(permute_predict)] <- 
+          max(permute_predict[is.finite(permute_predict)]) + 1
+      }
+      permuted_log_likelihood <- loglik_weibull(log(fitt$y), 
+                     permute_predict, 
+                     status, 
+                     fitt$sigmasq_tilde)
+      2*(current_log_likelihood - permuted_log_likelihood)
+    })
+  )
+})
+permute_stats <- std(permute_stats)
+permute_stats <- permute_stats + abs(min(permute_stats))
+permute_stats <- permute_stats / sum(permute_stats)
+names(permute_stats) <- colnames(X)
+
+## Variable importance is their average difference
+barplot(sort(permute_stats), 
+        horiz = TRUE, 
+        main = 'Relative Variable Importance', 
+        cex.names = 1.25,
+        las = 2)
+par(mar = c(5.1, 4.1, 4.1, 2.1))
+```
+
+## Traditional Statistical Inference
+
+Below, two-sided 95% Wald confidence intervals are computed for each intervention. 
+
+Note, for effects < 1 here, this has a negative impact on churn (it accelerates time-to-churn).
+
+For effects > 1, this has a positive impact on churn (it decelerates time-to-churn).
+
+The "STELLAR" gift had best estimated effect on time-to-churn out of all interventions, which was unsurprising since per the company's representative, the STELLAR gift happened to be the most generous.
+
+The "ADVENT" gift, which was most important per variable importance, actually had an estimated negative impact on time-to-churn. 
+
+Confidence intervals for "MANOS_WAL_A/B" and "dynamic" gifts included 1; Wald hypothesis tests for a null effect would fail to be rejected at the 5% threshold for testing statistical significance. 
+
+```{r}
+## Wald tests
+wald <- fitt$wald_univariate()$pval
+nms <- names(fitt$B[[1]])[grepl('repeat_order', names(fitt$B[[1]]))]
+inds <- unlist(sapply(nms,function(nm)which(names(fitt$B[[1]]) == nm)))
+dat <- cbind(cbind(round(exp(unlist(fitt$B)[inds]), 
+                  4)),
+             cbind(cbind(c(round(exp(fitt$wald_univariate(fitt$sigmasq_tilde)$interval_lb)[inds], 4))),
+             cbind(c(round(exp(fitt$wald_univariate(fitt$sigmasq_tilde)$interval_ub)[inds], 4)))))
+colnames(dat) <- c("Estimate", "LB", "UB")
+kable(dat)
+```
+
+## Auto-recommendation System
+
+The auto-recommendation system is an application of Thompson sampling to a survival model, and can be seen as analogous to response adaptive randomization sometimes used for clinical trials. 
+
+Suppose we have a new subject that appears in our dataset as follows. For now, notice no treatments have been given out, and they haven't quit their subscription yet.
+
+```{r}
+new_subject <- X[1,, drop = FALSE]
+new_subject[,8+1:length(unq_messages)] <- 0
+showthis <- t(new_subject)
+colnames(showthis) <- "Predictor Value"
+kable(showthis)
+```
+
+
+The algorithm for deciding which email intervention to assign works as follows, after fitting a model to existing data. 
+
+1) Randomly generate a posterior draw of model coefficients 
+
+Our "predictions" for purposes or recommendation in real-time are based NOT on our estimates of coefficients, but uses a random draw of coefficients from their posterior distribution instead. 
+
+More specifically, instead of using the maximum likelihood estimate $\boldsymbol{\hat{\beta}}$ as is, we randomly draw coefficients from a multivariate normal distribution $\boldsymbol{\beta} \sim \mathcal{N}(\boldsymbol{\hat{\beta}}, \frac{\sigma^2}{N}\textbf{G})$ where $\sigma^2\textbf{G}$ is the inverted negative Hessian of the Weibull joint log-likelihood evaluated at the maximum likelihood estimates, treating the smoothing spline penalty and ridge penalty as multivariate normal priors. This is a finite sample approximation to the asymptotic distribution of $\boldsymbol{\beta}$ as dictated by Bernstein von Mises, essentially using Laplace's approximation.
+
+Dispersion term $\sigma^2$ are also drawn randomly using an Inverse-Gamma distribution to properly capture uncertainty associated with unknown scale parameter, but is not very important to the results here (see the details of lgspline for more information on how this is performed in practice).
+
+```{r}
+new_B <- fitt$generate_posterior(
+  fitt$sigmasq_tilde,
+  newdat = new_subject)$post_draw_coefficients
+rownames(new_B[[1]]) <- names(fitt$B[[1]])
+showthis <- new_B[[1]][inds,,drop=FALSE]
+colnames(showthis) <- "Posterior Draw"
+kable(showthis)
+```
+
+Compare the above coefficients to the estimates previously provided, notice how they differ. 
+
+2) Based on this draw, assign the new customer to the treatment predicted-best
+
+Here, I arbitrarily assumed 5 dollars of profit per month and 25 dollars as a cost per-intervention. In practice, "5" and "25" would be swapped with actual cost and profit.
+
+```{r}
+profit_per_month <- 5
+cost_per_intervention <- 25
+pred_0 <- fitt$predict(new_predictors = new_subject,
+                       B_predict = new_B)*profit_per_month
+```
+
+This captures a posterior draw of profit for each intervention. Notice, that assigning no intervention at all is apparently more profitable than some interventions.
+
+```{r}
+Profit <- c(pred_0, sapply(8 + 1:length(unq_messages), function(trt){
+  newdat_trt <- new_subject
+  newdat_trt[,trt] <- 1
+  fitt$predict(new_predictors = newdat_trt,
+                B_predict = new_B)*profit_per_month - 
+    cost_per_intervention
+}))
+names(Profit) <- c("None", unq_messages)
+kable(cbind(Profit))
+```
+
+The "CONTROL" gift intervention (the usual email sent out to customers) yields the best profit for this draw. So for this new customer, we would send out the "CONTORL" intervention as recommended. This occurs even when the best predicted intervention is "STELLAR" using maximum likelihood estimates $\boldsymbol{\hat{\beta}}$ alone.
+
+This is the "exploration vs. exploitation" balance that Bayesian optimization attempts. Formally, email interventions are assigned with probability proportional to their posterior probability of being "best", rather than assigned according to point estimates of which is "best". Completely random assignment can be thought of as pure exploration, while using the maximum likelihood estimates alone can be thought of as pure exploitation, with Thompson sampling offering a balance of both. 
+
+The goal is to improve upon completely random assignment, while still allowing for statistically valid inference to be made. 
+
+3) Repeat
+
+At this point, the new subject and their intervention will be recorded to the dataset, the AFT model will be re-fit with the new subject, and steps 1-2 will repeat for the next customer. Notice, we don't need to wait to observe the new subject "churn" before incorporating them into analysis, since the model inherently incorporates right-censoring. 
+
+For most businesses, it is impractical to do this for one subject at a time; when assigning interventions to multiple subjects at once, it is important to generate a new draw of coefficients for each subject separately (otherwise all subjects would be assigned the same intervention, which "over-exploits" in Bayesian optimization jargon). 
+
+# Limitations
+
+The analysis provided here isn't perfect. Estimating out-of-sample performance and generalizability was not examined here, due to limitations on computational resources, the inherent challenges in quantifying predictive performance for survival models using cross-validation, a desire to keep inferences simple and straightforward, and other issues. Alternate distributions to Weibull (such as log-normal) and semi-parametric Cox regression were not explored, but remain popular for survival analysis in general.
+
+The model fit has other problems; the maximum time-to-event observed in the data was 5.39 years (64.69 months) but the maximum predicted survival time was 126545012751075293274820 months, an impossibly large number that essentially equates to "never churning". As seen from the Weibull plot, many customers seemingly churned immediately, and it's possible a hurdle model or more sophisticated approach would be needed to account for seemingly inflated times near-0. 
+
+Finally, the profit and cost per-intervention were arbitrarily selected, and not provided by the company. 
+
+In summary, while the inferences and recommendation system using the model are powerful tools for analyzing churn, there seems to be a degree of overconfidence in the AFT model causing occasionally absurd results. When using this tool in practice, incorporating some sanity checks on the predictions being made would be important, and looking closer at the data collection process for errors (something I don't have access to) would be required. 
+
+
