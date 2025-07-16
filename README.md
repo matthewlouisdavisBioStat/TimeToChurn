@@ -1,2 +1,2 @@
 # TimeToChurn
-A classic survival analysis for clinical trial data is applied to the most important problem facing growing businesses, driven primarily by online engagement. 
+A classic survival analysis for clinical trial data is applied to an important problem facing growing businesses. Data, code, and materials for reproducing results are provided here.
