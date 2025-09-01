@@ -332,7 +332,7 @@ kable(displaythis)
 
 The dataset in total has 34,557 observations and 14 predictors. 
 
-```{r}
+```{r, eval = FALSE, include = FALSE}
 pander(dim(X))
 ```
 
